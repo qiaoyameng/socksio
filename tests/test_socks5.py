@@ -1,5 +1,6 @@
 import pytest
 
+from fake_gssapi import FakeGSSAPIContext
 from socksio import (
     ProtocolError,
     SOCKS5AType,
@@ -94,7 +95,7 @@ def test_socks5_auth_request() -> None:
     ],
 )
 def test_socks5_auth_reply_accepted(auth_method: SOCKS5AuthMethod) -> None:
-    conn = SOCKS5Connection()
+    conn = SOCKS5Connection(gssapi_context=FakeGSSAPIContext())
     auth_methods = [
         SOCKS5AuthMethod.NO_AUTH_REQUIRED,
         SOCKS5AuthMethod.USERNAME_PASSWORD,

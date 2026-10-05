@@ -1,6 +1,13 @@
 """Sans-I/O implementation of SOCKS4, SOCKS4A, and SOCKS5."""
 
 from .exceptions import ProtocolError, SOCKSError
+from .gssapi import (
+    GSSAPIContext,
+    GSSAPIMessageType,
+    GSSAPIProtectionLevel,
+    GSSAPIState,
+    SOCKS5GSSAPIAuthenticator,
+)
 from .socks4 import (
     SOCKS4ARequest,
     SOCKS4Command,
@@ -25,6 +32,10 @@ from .socks5 import (
 __version__ = "1.0.0"
 
 __all__ = [
+    "GSSAPIContext",
+    "GSSAPIMessageType",
+    "GSSAPIProtectionLevel",
+    "GSSAPIState",
     "SOCKS4Request",
     "SOCKS4ARequest",
     "SOCKS4Reply",
@@ -32,6 +43,7 @@ __all__ = [
     "SOCKS4Command",
     "SOCKS4ReplyCode",
     "SOCKS5AType",
+    "SOCKS5GSSAPIAuthenticator",
     "SOCKS5AuthMethodsRequest",
     "SOCKS5AuthReply",
     "SOCKS5AuthMethod",

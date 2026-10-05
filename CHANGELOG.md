@@ -3,6 +3,8 @@
 ## Unreleased
 
 - Drop support for Python <3.10, Python 3.10 is now the minimum supported/tested version
+- Add SOCKS5 GSSAPI authentication (RFC 1961) with a caller-injected GSSAPI
+context, protection level negotiation, and wrapped command/data phases
 
 ## 1.0.0 (2020-04-17)
 
