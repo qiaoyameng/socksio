@@ -21,6 +21,44 @@ class SOCKS5AuthMethod(bytes, enum.Enum):
     NO_ACCEPTABLE_METHODS = b"\xff"
 
 
+class SOCKS5GSSAPIProtectionLevel(enum.IntEnum):
+    """Enumeration of GSSAPI protection levels (RFC 1961)."""
+
+    NONE = 0x00
+    INTEGRITY = 0x01
+    CONFIDENTIALITY = 0x02
+
+
+class GSSAPIContext(typing.Protocol):
+    """Protocol of the GSSAPI security context injected by the caller.
+
+    The library never acquires credentials by itself: the caller is
+    responsible for providing a context object (for example wrapping
+    ``gssapi`` or ``pyspnego``) exposing this interface.
+    """
+
+    @property
+    def complete(self) -> bool:
+        """Whether the security context has been fully established."""
+        ...  # pragma: nocover
+
+    def step(self, token: bytes) -> bytes:
+        """Processes an incoming token and returns the token to send back."""
+        ...  # pragma: nocover
+
+    def wrap(self, data: bytes) -> bytes:
+        """Signs (and optionally encrypts) data, returning a wrapped token."""
+        ...  # pragma: nocover
+
+    def unwrap(self, data: bytes) -> bytes:
+        """Verifies a wrapped token and returns the unwrapped data.
+
+        Must raise an exception if the integrity or confidentiality
+        protection of the token cannot be verified.
+        """
+        ...  # pragma: nocover
+
+
 class SOCKS5Command(bytes, enum.Enum):
     """Enumeration of SOCKS5 commands."""
 
@@ -149,6 +187,132 @@ class SOCKS5UsernamePasswordReply(typing.NamedTuple):
             The unpacked authentication reply instance.
         """
         return cls(success=data == b"\x01\x00")
+
+
+class SOCKS5GSSAPIRequest(typing.NamedTuple):
+    """Encapsulates a GSSAPI authentication token message to the proxy (RFC 1961).
+
+    Args:
+        token: The token produced by the GSSAPI security context.
+    """
+
+    token: bytes
+
+    def dumps(self) -> bytes:
+        """Packs the instance into a raw binary in the appropriate form.
+
+        Returns:
+            The packed request.
+        """
+        return b"".join(
+            [
+                b"\x01",  # GSSAPI sub-negotiation version
+                b"\x01",  # MTYP: authentication message
+                len(self.token).to_bytes(2, byteorder="big"),
+                self.token,
+            ]
+        )
+
+
+class SOCKS5GSSAPIReply(typing.NamedTuple):
+    """Encapsulates a GSSAPI authentication token reply from the proxy.
+
+    Args:
+        token: The token to feed into the GSSAPI security context.
+
+    Raises:
+        ProtocolError: If the data does not conform with the expected structure.
+    """
+
+    token: bytes
+
+    @classmethod
+    def loads(cls, data: bytes) -> "SOCKS5GSSAPIReply":
+        """Unpacks the GSSAPI authentication reply data into an instance.
+
+        Returns:
+            The unpacked GSSAPI authentication reply instance.
+
+        Raises:
+            ProtocolError: If the data does not match the spec.
+        """
+        if len(data) < 4:
+            raise ProtocolError("Malformed GSSAPI reply")
+        if data[0:1] != b"\x01":
+            raise ProtocolError("Malformed GSSAPI reply: unsupported version")
+        if data[1:2] != b"\x01":
+            raise ProtocolError("Malformed GSSAPI reply: unexpected message type")
+        token_length = int.from_bytes(data[2:4], byteorder="big")
+        if len(data) - 4 != token_length:
+            raise ProtocolError("Malformed GSSAPI reply: token length mismatch")
+        return cls(token=data[4:])
+
+
+class SOCKS5GSSAPIProtectionRequest(typing.NamedTuple):
+    """Encapsulates a GSSAPI protection level negotiation request (RFC 1961).
+
+    Args:
+        protection_levels: Bitmask of the acceptable protection levels.
+    """
+
+    protection_levels: int
+
+    def dumps(self) -> bytes:
+        """Packs the instance into a raw binary in the appropriate form.
+
+        Returns:
+            The packed request.
+        """
+        return b"".join(
+            [
+                b"\x01",  # GSSAPI sub-negotiation version
+                b"\x02",  # MTYP: protection level negotiation
+                b"\x00\x01",  # LEN: a single token byte follows
+                self.protection_levels.to_bytes(1, byteorder="big"),
+            ]
+        )
+
+
+class SOCKS5GSSAPIProtectionReply(typing.NamedTuple):
+    """Encapsulates a GSSAPI protection level negotiation reply from the proxy.
+
+    Args:
+        protection_level: The protection level selected by the proxy.
+
+    Raises:
+        ProtocolError: If the data does not conform with the expected structure.
+    """
+
+    protection_level: SOCKS5GSSAPIProtectionLevel
+
+    @classmethod
+    def loads(cls, data: bytes) -> "SOCKS5GSSAPIProtectionReply":
+        """Unpacks the GSSAPI protection level reply data into an instance.
+
+        Returns:
+            The unpacked GSSAPI protection level reply instance.
+
+        Raises:
+            ProtocolError: If the data does not match the spec.
+        """
+        if len(data) != 5:
+            raise ProtocolError("Malformed GSSAPI protection reply")
+        if data[0:1] != b"\x01":
+            raise ProtocolError(
+                "Malformed GSSAPI protection reply: unsupported version"
+            )
+        if data[1:2] != b"\x02":
+            raise ProtocolError(
+                "Malformed GSSAPI protection reply: unexpected message type"
+            )
+        if data[2:4] != b"\x00\x01":
+            raise ProtocolError("Malformed GSSAPI protection reply: invalid length")
+        try:
+            return cls(protection_level=SOCKS5GSSAPIProtectionLevel(data[4]))
+        except ValueError as exc:
+            raise ProtocolError(
+                "Malformed GSSAPI protection reply: unknown protection level"
+            ) from exc
 
 
 class SOCKS5CommandRequest(typing.NamedTuple):
@@ -298,6 +462,8 @@ class SOCKS5State(enum.IntEnum):
     CLIENT_WAITING_FOR_USERNAME_PASSWORD = 5
     SERVER_VERIFY_USERNAME_PASSWORD = 6
     MUST_CLOSE = 7
+    SERVER_GSSAPI_TOKEN_REPLY = 8
+    SERVER_GSSAPI_PROTECTION_REPLY = 9
 
 
 SOCKS5RequestType = typing.Union[SOCKS5AuthMethodsRequest, SOCKS5CommandRequest]
@@ -308,17 +474,51 @@ class SOCKS5Connection:
 
     Packs request objects into data suitable to be send and unpacks reply
     data into their appropriate reply objects.
+
+    If the proxy selects the GSSAPI authentication method, the connection
+    drives the RFC 1961 sub-negotiation using the injected ``gssapi_context``:
+    authentication tokens are exchanged until the context is complete, then
+    a protection level is negotiated. If integrity or confidentiality
+    protection is selected, the SOCKS command request/reply and all
+    subsequent application data are wrapped with the context and framed as
+    ``2-byte length + wrapped token`` records on the wire.
+
+    Args:
+        gssapi_context: A caller-provided GSSAPI security context exposing
+            ``step``, ``wrap``, ``unwrap`` and a ``complete`` property.
+            The library never looks up credentials by itself.
+        minimum_gssapi_protection_level: The minimum protection level the
+            proxy is allowed to select. Negotiations below this level are
+            rejected and the connection must be closed.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        gssapi_context: typing.Optional[GSSAPIContext] = None,
+        minimum_gssapi_protection_level: SOCKS5GSSAPIProtectionLevel = (
+            SOCKS5GSSAPIProtectionLevel.NONE
+        ),
+    ) -> None:
         self._data_to_send = bytearray()
         self._received_data = bytearray()
         self._state = SOCKS5State.CLIENT_AUTH_REQUIRED
+        self._gssapi_context = gssapi_context
+        self._minimum_gssapi_protection_level = minimum_gssapi_protection_level
+        self._gssapi_protection_level: typing.Optional[
+            SOCKS5GSSAPIProtectionLevel
+        ] = None
 
     @property
     def state(self) -> SOCKS5State:
         """Returns the current state of the protocol."""
         return self._state
+
+    @property
+    def _gssapi_protected(self) -> bool:
+        return (
+            self._gssapi_protection_level is not None
+            and self._gssapi_protection_level != SOCKS5GSSAPIProtectionLevel.NONE
+        )
 
     @singledispatchmethod
     def send(self, request: SOCKS5RequestType) -> None:
@@ -345,15 +545,39 @@ class SOCKS5Connection:
 
     @send.register(SOCKS5CommandRequest)
     def _command(self, request: SOCKS5CommandRequest) -> None:
-        if self._state < SOCKS5State.CLIENT_AUTHENTICATED:
+        if self._state not in (
+            SOCKS5State.CLIENT_AUTHENTICATED,
+            SOCKS5State.TUNNEL_READY,
+        ):
             raise ProtocolError(
                 "SOCKS5 connections must be authenticated before sending a request"
             )
-        self._data_to_send += request.dumps()
+        self._data_to_send += self._protect(request.dumps())
+
+    def send_data(self, data: bytes) -> None:
+        """Packs application data to be sent through the established tunnel.
+
+        If GSSAPI integrity or confidentiality protection was negotiated,
+        the data is wrapped with the GSSAPI context and framed as a record.
+
+        Args:
+            data: The application data to send.
+        """
+        if self._state != SOCKS5State.TUNNEL_READY:
+            raise ProtocolError("The SOCKS5 tunnel is not ready yet")
+        self._data_to_send += self._protect(data)
 
     def receive_data(
         self, data: bytes
-    ) -> typing.Union[SOCKS5AuthReply, SOCKS5Reply, SOCKS5UsernamePasswordReply]:
+    ) -> typing.Union[
+        SOCKS5AuthReply,
+        SOCKS5Reply,
+        SOCKS5UsernamePasswordReply,
+        SOCKS5GSSAPIReply,
+        SOCKS5GSSAPIProtectionReply,
+        bytes,
+        None,
+    ]:
         """Unpacks response data into a reply object.
 
         Args:
@@ -361,6 +585,8 @@ class SOCKS5Connection:
 
         Returns:
             A reply instance corresponding to the connection state and reply data.
+            Once the tunnel is ready, returns the (unwrapped) application data,
+            or None if a complete protected record has not been received yet.
         """
         if self._state == SOCKS5State.SERVER_AUTH_REPLY:
             auth_reply = SOCKS5AuthReply.loads(data)
@@ -368,6 +594,13 @@ class SOCKS5Connection:
                 self._state = SOCKS5State.CLIENT_WAITING_FOR_USERNAME_PASSWORD
             elif auth_reply.method == SOCKS5AuthMethod.NO_AUTH_REQUIRED:
                 self._state = SOCKS5State.CLIENT_AUTHENTICATED
+            elif auth_reply.method == SOCKS5AuthMethod.GSSAPI:
+                if self._gssapi_context is None:
+                    self._state = SOCKS5State.MUST_CLOSE
+                    raise ProtocolError(
+                        "GSSAPI authentication requires a GSSAPI context"
+                    )
+                self._step_gssapi(b"")
             return auth_reply
 
         if self._state == SOCKS5State.SERVER_VERIFY_USERNAME_PASSWORD:
@@ -378,7 +611,40 @@ class SOCKS5Connection:
                 self._state = SOCKS5State.MUST_CLOSE
             return username_password_reply
 
+        if self._state == SOCKS5State.SERVER_GSSAPI_TOKEN_REPLY:
+            try:
+                gssapi_reply = SOCKS5GSSAPIReply.loads(data)
+            except ProtocolError:
+                self._state = SOCKS5State.MUST_CLOSE
+                raise
+            self._step_gssapi(gssapi_reply.token)
+            return gssapi_reply
+
+        if self._state == SOCKS5State.SERVER_GSSAPI_PROTECTION_REPLY:
+            try:
+                protection_reply = SOCKS5GSSAPIProtectionReply.loads(data)
+            except ProtocolError:
+                self._state = SOCKS5State.MUST_CLOSE
+                raise
+            if (
+                protection_reply.protection_level
+                < self._minimum_gssapi_protection_level
+            ):
+                self._state = SOCKS5State.MUST_CLOSE
+                raise ProtocolError(
+                    "The proxy selected a GSSAPI protection level "
+                    "below the required minimum"
+                )
+            self._gssapi_protection_level = protection_reply.protection_level
+            self._state = SOCKS5State.CLIENT_AUTHENTICATED
+            return protection_reply
+
         if self._state == SOCKS5State.CLIENT_AUTHENTICATED:
+            if self._gssapi_protected:
+                unwrapped_data = self._receive_protected_record(data)
+                if unwrapped_data is None:
+                    return None
+                data = unwrapped_data
             reply = SOCKS5Reply.loads(data)
             if reply.reply_code == SOCKS5ReplyCode.SUCCEEDED:
                 self._state = SOCKS5State.TUNNEL_READY
@@ -387,7 +653,78 @@ class SOCKS5Connection:
 
             return reply
 
+        if self._state == SOCKS5State.TUNNEL_READY:
+            if self._gssapi_protected:
+                return self._receive_protected_record(data)
+            return data
+
+        if self._state == SOCKS5State.MUST_CLOSE:
+            raise ProtocolError("The connection is failed and must be closed")
+
         raise NotImplementedError()  # pragma: nocover
+
+    def _step_gssapi(self, token: bytes) -> None:
+        """Advances the GSSAPI context and queues the next protocol message."""
+        assert self._gssapi_context is not None
+        try:
+            output_token = self._gssapi_context.step(token)
+        except Exception as exc:
+            self._state = SOCKS5State.MUST_CLOSE
+            raise ProtocolError("GSSAPI authentication failed") from exc
+        if not self._gssapi_context.complete:
+            self._data_to_send += SOCKS5GSSAPIRequest(token=output_token).dumps()
+            self._state = SOCKS5State.SERVER_GSSAPI_TOKEN_REPLY
+            return
+        if output_token:
+            self._data_to_send += SOCKS5GSSAPIRequest(token=output_token).dumps()
+        self._data_to_send += SOCKS5GSSAPIProtectionRequest(
+            protection_levels=self._acceptable_gssapi_protection_levels()
+        ).dumps()
+        self._state = SOCKS5State.SERVER_GSSAPI_PROTECTION_REPLY
+
+    def _acceptable_gssapi_protection_levels(self) -> int:
+        """Returns the bitmask of protection levels acceptable to offer."""
+        levels = 0
+        minimum = self._minimum_gssapi_protection_level
+        if minimum <= SOCKS5GSSAPIProtectionLevel.INTEGRITY:
+            levels |= SOCKS5GSSAPIProtectionLevel.INTEGRITY
+        if minimum <= SOCKS5GSSAPIProtectionLevel.CONFIDENTIALITY:
+            levels |= SOCKS5GSSAPIProtectionLevel.CONFIDENTIALITY
+        return levels
+
+    def _protect(self, data: bytes) -> bytes:
+        """Wraps and frames data if GSSAPI protection was negotiated."""
+        if not self._gssapi_protected:
+            return data
+        assert self._gssapi_context is not None
+        try:
+            token = self._gssapi_context.wrap(data)
+        except Exception as exc:
+            self._state = SOCKS5State.MUST_CLOSE
+            raise ProtocolError("Failed to protect data with GSSAPI") from exc
+        return len(token).to_bytes(2, byteorder="big") + token
+
+    def _receive_protected_record(self, data: bytes) -> typing.Optional[bytes]:
+        """Buffers a protected record and returns its verified plaintext.
+
+        Returns None if a complete record has not been received yet. Data
+        that fails verification is never returned: the connection must be
+        closed instead of falling back to plaintext.
+        """
+        self._received_data += data
+        if len(self._received_data) < 2:
+            return None
+        token_length = int.from_bytes(self._received_data[0:2], byteorder="big")
+        if len(self._received_data) < 2 + token_length:
+            return None
+        token = bytes(self._received_data[2 : 2 + token_length])
+        del self._received_data[: 2 + token_length]
+        assert self._gssapi_context is not None
+        try:
+            return self._gssapi_context.unwrap(token)
+        except Exception as exc:
+            self._state = SOCKS5State.MUST_CLOSE
+            raise ProtocolError("Failed to verify protected data with GSSAPI") from exc
 
     def data_to_send(self) -> bytes:
         """Returns the data to be sent via the I/O library of choice.

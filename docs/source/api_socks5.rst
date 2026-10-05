@@ -20,6 +20,24 @@ SOCKS5 API documentation
 .. autoclass:: SOCKS5UsernamePasswordReply
    :members: loads
 
+.. autoclass:: GSSAPIContext
+   :members: complete, step, wrap, unwrap
+
+.. autoclass:: SOCKS5GSSAPIProtectionLevel
+   :members:
+
+.. autoclass:: SOCKS5GSSAPIRequest
+   :members: dumps
+
+.. autoclass:: SOCKS5GSSAPIReply
+   :members: loads
+
+.. autoclass:: SOCKS5GSSAPIProtectionRequest
+   :members: dumps
+
+.. autoclass:: SOCKS5GSSAPIProtectionReply
+   :members: loads
+
 .. autoclass:: SOCKS5CommandRequest
    :members: from_address, dumps
 

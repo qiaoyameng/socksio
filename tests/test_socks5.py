@@ -90,7 +90,6 @@ def test_socks5_auth_request() -> None:
     [
         SOCKS5AuthMethod.NO_AUTH_REQUIRED,
         SOCKS5AuthMethod.USERNAME_PASSWORD,
-        SOCKS5AuthMethod.GSSAPI,
     ],
 )
 def test_socks5_auth_reply_accepted(auth_method: SOCKS5AuthMethod) -> None:
