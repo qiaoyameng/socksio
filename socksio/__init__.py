@@ -17,8 +17,11 @@ from .socks5 import (
     SOCKS5Command,
     SOCKS5CommandRequest,
     SOCKS5Connection,
+    SOCKS5DataReceived,
     SOCKS5Reply,
     SOCKS5ReplyCode,
+    SOCKS5ServerConnection,
+    SOCKS5UsernamePasswordReply,
     SOCKS5UsernamePasswordRequest,
 )
 
@@ -40,6 +43,9 @@ __all__ = [
     "SOCKS5CommandRequest",
     "SOCKS5ReplyCode",
     "SOCKS5Reply",
+    "SOCKS5DataReceived",
+    "SOCKS5ServerConnection",
+    "SOCKS5UsernamePasswordReply",
     "SOCKS5UsernamePasswordRequest",
     "SOCKSError",
     "ProtocolError",

@@ -8,20 +8,26 @@ SOCKS5 API documentation
 .. autoclass:: SOCKS5Connection
    :members:
 
+.. autoclass:: SOCKS5ServerConnection
+   :members:
+
 .. autoclass:: SOCKS5AuthMethodsRequest
-   :members: dumps
+   :members: loads, dumps
+
+.. autoclass:: SOCKS5DataReceived
+   :members:
 
 .. autoclass:: SOCKS5AuthReply
-   :members: loads
+   :members: loads, dumps
 
 .. autoclass:: SOCKS5UsernamePasswordRequest
-   :members: dumps
+   :members: loads, dumps
 
 .. autoclass:: SOCKS5UsernamePasswordReply
-   :members: loads
+   :members: loads, dumps
 
 .. autoclass:: SOCKS5CommandRequest
-   :members: from_address, dumps
+   :members: from_address, loads, dumps
 
 .. autoclass:: SOCKS5Reply
-   :members: loads
+   :members: from_address, loads, dumps
