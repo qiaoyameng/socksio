@@ -206,11 +206,26 @@ class SOCKS4Reply(typing.NamedTuple):
             raise ProtocolError("Malformed reply") from exc
 
 
+class SOCKS4State(enum.IntEnum):
+    """Enumeration of SOCKS4 protocol states."""
+
+    CLIENT_REQUEST_REQUIRED = 1
+    SERVER_REPLY = 2
+    SERVER_BIND_FIRST_REPLY = 3
+    SERVER_BIND_SECOND_REPLY = 4
+    TUNNEL_READY = 5
+    MUST_CLOSE = 6
+
+
 class SOCKS4Connection:
     """Encapsulates a SOCKS4 and SOCKS4A connection.
 
     Packs request objects into data suitable to be send and unpacks reply
     data into their appropriate reply objects.
+
+    BIND requests receive two replies: the first reports the address the
+    proxy is listening on and the second reports the connecting host. Only
+    after a successful second reply is the tunnel ready.
 
     Args:
         user_id: The user ID to be sent as part of the requests.
@@ -221,27 +236,114 @@ class SOCKS4Connection:
 
         self._data_to_send = bytearray()
         self._received_data = bytearray()
+        self._tunnel_data = bytearray()
+        self._state = SOCKS4State.CLIENT_REQUEST_REQUIRED
+
+    @property
+    def state(self) -> SOCKS4State:
+        """Returns the current state of the protocol."""
+        return self._state
 
     def send(self, request: typing.Union[SOCKS4Request, SOCKS4ARequest]) -> None:
         """Packs a request object and adds it to the send data buffer.
 
+        Also progresses the protocol state of the connection.
+
         Args:
             request: The request instance to be packed.
+
+        Raises:
+            ProtocolError: If called while waiting for a BIND reply.
         """
+        if self._state in (
+            SOCKS4State.SERVER_BIND_FIRST_REPLY,
+            SOCKS4State.SERVER_BIND_SECOND_REPLY,
+        ):
+            raise ProtocolError(
+                "Cannot send another command while waiting for a BIND reply"
+            )
         user_id = request.user_id or self.user_id
         self._data_to_send += request.dumps(user_id=user_id)
+        if request.command == SOCKS4Command.BIND:
+            self._state = SOCKS4State.SERVER_BIND_FIRST_REPLY
+        else:
+            self._state = SOCKS4State.SERVER_REPLY
 
-    def receive_data(self, data: bytes) -> SOCKS4Reply:
+    def receive_data(
+        self, data: bytes
+    ) -> typing.Optional[typing.Union[SOCKS4Reply, bytes]]:
         """Unpacks response data into a reply object.
 
         Args:
             data: The raw response data from the proxy server.
 
         Returns:
-            The appropriate reply object.
+            The appropriate reply object, ``None`` if a BIND reply was only
+            partially received, or raw ``bytes`` once the tunnel is ready.
+        """
+        if self._state == SOCKS4State.TUNNEL_READY:
+            self._tunnel_data += data
+            return self.tunnel_data()
+
+        if self._state in (
+            SOCKS4State.SERVER_BIND_FIRST_REPLY,
+            SOCKS4State.SERVER_BIND_SECOND_REPLY,
+        ):
+            return self._receive_bind_reply(data)
+
+        self._received_data += data
+        reply = SOCKS4Reply.loads(bytes(self._received_data))
+        if reply.reply_code == SOCKS4ReplyCode.REQUEST_GRANTED:
+            self._state = SOCKS4State.TUNNEL_READY
+        else:
+            self._state = SOCKS4State.MUST_CLOSE
+        return reply
+
+    def _receive_bind_reply(self, data: bytes) -> typing.Optional[SOCKS4Reply]:
+        """Parses one of the two replies expected from a BIND request.
+
+        Replies may arrive split across arbitrarily many ``receive_data``
+        calls, in which case ``None`` is returned until the full 8 byte
+        reply is available. Trailing bytes after a complete final reply are
+        preserved as the first bytes of tunnel data.
         """
         self._received_data += data
-        return SOCKS4Reply.loads(bytes(self._received_data))
+        if len(self._received_data) < 8:
+            return None
+
+        frame = bytes(self._received_data[:8])
+        extra = bytes(self._received_data[8:])
+        self._received_data = bytearray()
+        try:
+            reply = SOCKS4Reply.loads(frame)
+        except ProtocolError:
+            self._state = SOCKS4State.MUST_CLOSE
+            raise
+
+        if reply.reply_code != SOCKS4ReplyCode.REQUEST_GRANTED:
+            self._state = SOCKS4State.MUST_CLOSE
+            return reply
+
+        if self._state == SOCKS4State.SERVER_BIND_FIRST_REPLY:
+            self._state = SOCKS4State.SERVER_BIND_SECOND_REPLY
+            if extra:
+                self._received_data += extra
+            return reply
+
+        self._state = SOCKS4State.TUNNEL_READY
+        if extra:
+            self._tunnel_data += extra
+        return reply
+
+    def tunnel_data(self) -> bytes:
+        """Returns the raw tunnel data received, clearing the buffer.
+
+        The first tunnel data may already have been received together with
+        the final BIND reply.
+        """
+        data = bytes(self._tunnel_data)
+        self._tunnel_data = bytearray()
+        return data
 
     def data_to_send(self) -> bytes:
         """Returns the data to be sent via the I/O library of choice.

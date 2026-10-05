@@ -10,6 +10,7 @@ from socksio import (
     SOCKS4Request,
     SOCKSError,
 )
+from socksio.socks4 import SOCKS4State
 
 
 @pytest.mark.parametrize(
@@ -149,3 +150,161 @@ def test_SOCKS4A_connection_request(command: SOCKS4Command) -> None:
     assert data[4:8] == b"\x00\x00\x00\xff"
     assert data[8:14] == b"socks\x00"
     assert data[14:] == b"proxy.example.com\x00"
+
+
+
+def _socks4_reply(
+    code: SOCKS4ReplyCode = SOCKS4ReplyCode.REQUEST_GRANTED, data: bytes = b""
+) -> bytes:
+    return b"".join(
+        [
+            b"\x00",
+            code,
+            (1080).to_bytes(2, byteorder="big"),
+            b"\x7f\x00\x00\x01",
+            data,
+        ]
+    )
+
+
+@pytest.fixture
+def bind_conn() -> SOCKS4Connection:
+    conn = SOCKS4Connection(user_id=b"socks")
+    conn.send(
+        SOCKS4Request.from_address(SOCKS4Command.BIND, ("127.0.0.1", 1080))
+    )
+    conn.data_to_send()
+    return conn
+
+
+def _feed_byte_by_byte(conn: SOCKS4Connection, data: bytes, events: list) -> None:
+    for index in range(len(data) - 1):
+        assert conn.receive_data(data[index : index + 1]) is None
+    events.append(conn.receive_data(data[-1:]))
+
+
+def test_socks4_bind_first_success_is_not_tunnel_ready(
+    bind_conn: SOCKS4Connection
+) -> None:
+    events = []
+    _feed_byte_by_byte(bind_conn, _socks4_reply(), events)
+
+    assert events == [
+        SOCKS4Reply(
+            reply_code=SOCKS4ReplyCode.REQUEST_GRANTED, port=1080, addr="127.0.0.1"
+        )
+    ]
+    assert bind_conn.state == SOCKS4State.SERVER_BIND_SECOND_REPLY
+
+
+def test_socks4_bind_second_success_opens_tunnel(bind_conn: SOCKS4Connection) -> None:
+    events = []
+    _feed_byte_by_byte(bind_conn, _socks4_reply(), events)
+    _feed_byte_by_byte(bind_conn, _socks4_reply(), events)
+
+    assert events == [
+        SOCKS4Reply(
+            reply_code=SOCKS4ReplyCode.REQUEST_GRANTED, port=1080, addr="127.0.0.1"
+        ),
+        SOCKS4Reply(
+            reply_code=SOCKS4ReplyCode.REQUEST_GRANTED, port=1080, addr="127.0.0.1"
+        ),
+    ]
+    assert bind_conn.state == SOCKS4State.TUNNEL_READY
+
+
+@pytest.mark.parametrize(
+    "waiting_state",
+    [SOCKS4State.SERVER_BIND_FIRST_REPLY, SOCKS4State.SERVER_BIND_SECOND_REPLY],
+)
+def test_socks4_bind_rejects_another_command_while_waiting(
+    bind_conn: SOCKS4Connection, waiting_state: SOCKS4State
+) -> None:
+    if waiting_state == SOCKS4State.SERVER_BIND_SECOND_REPLY:
+        _feed_byte_by_byte(bind_conn, _socks4_reply(), [])
+    assert bind_conn.state == waiting_state
+
+    with pytest.raises(ProtocolError):
+        bind_conn.send(
+            SOCKS4Request.from_address(SOCKS4Command.BIND, ("127.0.0.1", 1080))
+        )
+    with pytest.raises(ProtocolError):
+        bind_conn.send(
+            SOCKS4Request.from_address(SOCKS4Command.CONNECT, ("127.0.0.1", 1080))
+        )
+
+
+def test_socks4_bind_first_failure_is_terminal(bind_conn: SOCKS4Connection) -> None:
+    events = []
+    _feed_byte_by_byte(
+        bind_conn, _socks4_reply(SOCKS4ReplyCode.CONNECTION_FAILED), events
+    )
+
+    assert events == [
+        SOCKS4Reply(
+            reply_code=SOCKS4ReplyCode.CONNECTION_FAILED, port=1080, addr="127.0.0.1"
+        )
+    ]
+    assert bind_conn.state == SOCKS4State.MUST_CLOSE
+
+
+def test_socks4_bind_second_failure_is_terminal(bind_conn: SOCKS4Connection) -> None:
+    events = []
+    _feed_byte_by_byte(bind_conn, _socks4_reply(), events)
+    _feed_byte_by_byte(
+        bind_conn, _socks4_reply(SOCKS4ReplyCode.CONNECTION_FAILED), events
+    )
+
+    assert events[0].reply_code == SOCKS4ReplyCode.REQUEST_GRANTED
+    assert events[1].reply_code == SOCKS4ReplyCode.CONNECTION_FAILED
+    assert bind_conn.state == SOCKS4State.MUST_CLOSE
+
+
+def test_socks4_bind_two_replies_with_tunnel_data_in_same_chunk(
+    bind_conn: SOCKS4Connection,
+) -> None:
+    first_reply = _socks4_reply()
+    second_reply = _socks4_reply(data=b"hello")
+    events = []
+    events.append(bind_conn.receive_data(first_reply + second_reply))
+    events.append(bind_conn.receive_data(b""))
+
+    assert events == [
+        SOCKS4Reply(
+            reply_code=SOCKS4ReplyCode.REQUEST_GRANTED, port=1080, addr="127.0.0.1"
+        ),
+        SOCKS4Reply(
+            reply_code=SOCKS4ReplyCode.REQUEST_GRANTED, port=1080, addr="127.0.0.1"
+        ),
+    ]
+    assert bind_conn.state == SOCKS4State.TUNNEL_READY
+    assert bind_conn.receive_data(b" world") == b"hello world"
+
+
+def test_socks4_connect_flow_unchanged() -> None:
+    conn = SOCKS4Connection(user_id=b"socks")
+    assert conn.state == SOCKS4State.CLIENT_REQUEST_REQUIRED
+
+    conn.send(
+        SOCKS4Request.from_address(SOCKS4Command.CONNECT, ("127.0.0.1", 1080))
+    )
+    assert conn.state == SOCKS4State.SERVER_REPLY
+
+    reply = conn.receive_data(_socks4_reply())
+
+    assert reply == SOCKS4Reply(
+        reply_code=SOCKS4ReplyCode.REQUEST_GRANTED, port=1080, addr="127.0.0.1"
+    )
+    assert conn.state == SOCKS4State.TUNNEL_READY
+    assert conn.receive_data(b"tunnel data") == b"tunnel data"
+
+
+def test_socks4_connect_failure_is_terminal() -> None:
+    conn = SOCKS4Connection(user_id=b"socks")
+    conn.send(
+        SOCKS4Request.from_address(SOCKS4Command.CONNECT, ("127.0.0.1", 1080))
+    )
+
+    conn.receive_data(_socks4_reply(SOCKS4ReplyCode.CONNECTION_FAILED))
+
+    assert conn.state == SOCKS4State.MUST_CLOSE

@@ -265,6 +265,42 @@ class SOCKS5Reply(typing.NamedTuple):
         except ValueError as exc:
             raise ProtocolError("Malformed reply") from exc
 
+    @staticmethod
+    def frame_length(data: bytes) -> typing.Optional[int]:
+        """Returns the length of the first complete reply frame in ``data``.
+
+        Returns ``None`` if ``data`` does not yet contain a full reply.
+
+        Raises:
+            ProtocolError: If enough data was received to tell the reply
+                does not conform to the spec.
+        """
+        if not data:
+            return None
+        if data[0:1] != b"\x05":
+            raise ProtocolError("Malformed reply")
+        if len(data) < 4:
+            return None
+
+        try:
+            atype = SOCKS5AType(data[3:4])
+        except ValueError as exc:
+            raise ProtocolError("Malformed reply") from exc
+
+        if atype == SOCKS5AType.IPV4_ADDRESS:
+            address_length = 4
+        elif atype == SOCKS5AType.IPV6_ADDRESS:
+            address_length = 16
+        else:
+            if len(data) < 5:
+                return None
+            address_length = data[4] + 1
+
+        frame_length = 4 + address_length + 2
+        if len(data) < frame_length:
+            return None
+        return frame_length
+
 
 class SOCKS5Datagram(typing.NamedTuple):
     """Encapsulates a SOCKS5 datagram for UDP connections.
@@ -298,6 +334,8 @@ class SOCKS5State(enum.IntEnum):
     CLIENT_WAITING_FOR_USERNAME_PASSWORD = 5
     SERVER_VERIFY_USERNAME_PASSWORD = 6
     MUST_CLOSE = 7
+    SERVER_BIND_FIRST_REPLY = 8
+    SERVER_BIND_SECOND_REPLY = 9
 
 
 SOCKS5RequestType = typing.Union[SOCKS5AuthMethodsRequest, SOCKS5CommandRequest]
@@ -313,6 +351,7 @@ class SOCKS5Connection:
     def __init__(self) -> None:
         self._data_to_send = bytearray()
         self._received_data = bytearray()
+        self._tunnel_data = bytearray()
         self._state = SOCKS5State.CLIENT_AUTH_REQUIRED
 
     @property
@@ -349,19 +388,48 @@ class SOCKS5Connection:
             raise ProtocolError(
                 "SOCKS5 connections must be authenticated before sending a request"
             )
+        if self._state in (
+            SOCKS5State.SERVER_BIND_FIRST_REPLY,
+            SOCKS5State.SERVER_BIND_SECOND_REPLY,
+        ):
+            raise ProtocolError(
+                "Cannot send another command while waiting for a BIND reply"
+            )
         self._data_to_send += request.dumps()
+        if request.command == SOCKS5Command.BIND:
+            self._state = SOCKS5State.SERVER_BIND_FIRST_REPLY
 
     def receive_data(
         self, data: bytes
-    ) -> typing.Union[SOCKS5AuthReply, SOCKS5Reply, SOCKS5UsernamePasswordReply]:
+    ) -> typing.Optional[
+        typing.Union[SOCKS5AuthReply, SOCKS5Reply, SOCKS5UsernamePasswordReply, bytes]
+    ]:
         """Unpacks response data into a reply object.
+
+        For BIND requests two replies are expected: the first reply confirms
+        that the server is listening and the second reply confirms that the
+        remote host has connected. Only after the second successful reply is
+        the tunnel ready.
 
         Args:
             data: The raw response data from the proxy server.
 
         Returns:
-            A reply instance corresponding to the connection state and reply data.
+            A reply instance corresponding to the connection state and reply
+            data. ``None`` is returned when not enough data was received to
+            parse a complete reply. Once the tunnel is ready the raw tunnel
+            data is returned as ``bytes``.
         """
+        if self._state == SOCKS5State.TUNNEL_READY:
+            self._tunnel_data += data
+            return self.tunnel_data()
+
+        if self._state in (
+            SOCKS5State.SERVER_BIND_FIRST_REPLY,
+            SOCKS5State.SERVER_BIND_SECOND_REPLY,
+        ):
+            return self._receive_bind_reply(data)
+
         if self._state == SOCKS5State.SERVER_AUTH_REPLY:
             auth_reply = SOCKS5AuthReply.loads(data)
             if auth_reply.method == SOCKS5AuthMethod.USERNAME_PASSWORD:
@@ -388,6 +456,58 @@ class SOCKS5Connection:
             return reply
 
         raise NotImplementedError()  # pragma: nocover
+
+    def _receive_bind_reply(self, data: bytes) -> typing.Optional[SOCKS5Reply]:
+        """Parses one of the two replies expected from a BIND request.
+
+        Replies may arrive split across arbitrarily many ``receive_data``
+        calls, in which case ``None`` is returned until a full reply is
+        available. Trailing bytes after a complete final reply are preserved
+        as the first bytes of tunnel data.
+        """
+        self._received_data += data
+        try:
+            frame_length = SOCKS5Reply.frame_length(bytes(self._received_data))
+            if frame_length is None:
+                return None
+
+            frame = bytes(self._received_data[:frame_length])
+            extra = bytes(self._received_data[frame_length:])
+            self._received_data = bytearray()
+            if frame[3:4] == SOCKS5AType.DOMAIN_NAME:
+                # The RFC frame includes a 1 byte domain length prefix which
+                # SOCKS5Reply.loads does not expect, strip it.
+                frame = frame[:4] + frame[5:]
+            reply = SOCKS5Reply.loads(frame)
+        except ProtocolError:
+            self._received_data = bytearray()
+            self._state = SOCKS5State.MUST_CLOSE
+            raise
+
+        if reply.reply_code != SOCKS5ReplyCode.SUCCEEDED:
+            self._state = SOCKS5State.MUST_CLOSE
+            return reply
+
+        if self._state == SOCKS5State.SERVER_BIND_FIRST_REPLY:
+            self._state = SOCKS5State.SERVER_BIND_SECOND_REPLY
+            if extra:
+                self._received_data += extra
+            return reply
+
+        self._state = SOCKS5State.TUNNEL_READY
+        if extra:
+            self._tunnel_data += extra
+        return reply
+
+    def tunnel_data(self) -> bytes:
+        """Returns the raw tunnel data received, clearing the buffer.
+
+        The first tunnel data may already have been received together with
+        the final BIND reply.
+        """
+        data = bytes(self._tunnel_data)
+        self._tunnel_data = bytearray()
+        return data
 
     def data_to_send(self) -> bytes:
         """Returns the data to be sent via the I/O library of choice.

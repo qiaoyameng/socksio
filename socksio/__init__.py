@@ -8,6 +8,7 @@ from .socks4 import (
     SOCKS4Reply,
     SOCKS4ReplyCode,
     SOCKS4Request,
+    SOCKS4State,
 )
 from .socks5 import (
     SOCKS5AType,
@@ -19,6 +20,7 @@ from .socks5 import (
     SOCKS5Connection,
     SOCKS5Reply,
     SOCKS5ReplyCode,
+    SOCKS5State,
     SOCKS5UsernamePasswordRequest,
 )
 
@@ -30,6 +32,7 @@ __all__ = [
     "SOCKS4Reply",
     "SOCKS4Connection",
     "SOCKS4Command",
+    "SOCKS4State",
     "SOCKS4ReplyCode",
     "SOCKS5AType",
     "SOCKS5AuthMethodsRequest",
@@ -39,6 +42,7 @@ __all__ = [
     "SOCKS5Command",
     "SOCKS5CommandRequest",
     "SOCKS5ReplyCode",
+    "SOCKS5State",
     "SOCKS5Reply",
     "SOCKS5UsernamePasswordRequest",
     "SOCKSError",

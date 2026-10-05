@@ -366,3 +366,135 @@ def test_socks5_reply_error(
     assert reply == SOCKS5Reply(
         reply_code=error_code, atype=expected_atype, addr=expected_addr, port=1080
     )
+
+
+def _socks5_reply(code: bytes = SOCKS5ReplyCode.SUCCEEDED, data: bytes = b"") -> bytes:
+    return b"".join(
+        [
+            b"\x05",
+            code,
+            b"\x00",
+            b"\x01",
+            b"\x7f\x00\x00\x01",
+            (1080).to_bytes(2, byteorder="big"),
+            data,
+        ]
+    )
+
+
+@pytest.fixture
+def bind_conn(authenticated_conn: SOCKS5Connection) -> SOCKS5Connection:
+    authenticated_conn.send(
+        SOCKS5CommandRequest.from_address(SOCKS5Command.BIND, "127.0.0.1:1080")
+    )
+    authenticated_conn.data_to_send()
+    return authenticated_conn
+
+
+def _feed_byte_by_byte(
+    conn: SOCKS5Connection, data: bytes, events: list
+) -> None:
+    for index in range(len(data) - 1):
+        assert conn.receive_data(data[index : index + 1]) is None
+    events.append(conn.receive_data(data[-1:]))
+
+
+def test_socks5_bind_first_success_is_not_tunnel_ready(
+    bind_conn: SOCKS5Connection
+) -> None:
+    events = []
+    _feed_byte_by_byte(bind_conn, _socks5_reply(), events)
+
+    assert events == [
+        SOCKS5Reply(
+            reply_code=SOCKS5ReplyCode.SUCCEEDED,
+            atype=SOCKS5AType.IPV4_ADDRESS,
+            addr="127.0.0.1",
+            port=1080,
+        )
+    ]
+    assert bind_conn.state == SOCKS5State.SERVER_BIND_SECOND_REPLY
+
+
+def test_socks5_bind_second_success_opens_tunnel(bind_conn: SOCKS5Connection) -> None:
+    events = []
+    _feed_byte_by_byte(bind_conn, _socks5_reply(), events)
+    _feed_byte_by_byte(bind_conn, _socks5_reply(), events)
+
+    first_reply, second_reply = events
+    assert first_reply == second_reply == SOCKS5Reply(
+        reply_code=SOCKS5ReplyCode.SUCCEEDED,
+        atype=SOCKS5AType.IPV4_ADDRESS,
+        addr="127.0.0.1",
+        port=1080,
+    )
+    assert bind_conn.state == SOCKS5State.TUNNEL_READY
+
+
+@pytest.mark.parametrize(
+    "waiting_state",
+    [SOCKS5State.SERVER_BIND_FIRST_REPLY, SOCKS5State.SERVER_BIND_SECOND_REPLY],
+)
+def test_socks5_bind_rejects_another_command_while_waiting(
+    bind_conn: SOCKS5Connection, waiting_state: SOCKS5State
+) -> None:
+    if waiting_state == SOCKS5State.SERVER_BIND_SECOND_REPLY:
+        for byte in _socks5_reply()[:-1]:
+            bind_conn.receive_data(bytes([byte]))
+        bind_conn.receive_data(_socks5_reply()[-1:])
+    assert bind_conn.state == waiting_state
+
+    with pytest.raises(ProtocolError):
+        bind_conn.send(
+            SOCKS5CommandRequest.from_address(SOCKS5Command.CONNECT, "127.0.0.1:1080")
+        )
+    with pytest.raises(ProtocolError):
+        bind_conn.send(
+            SOCKS5CommandRequest.from_address(SOCKS5Command.BIND, "127.0.0.1:1080")
+        )
+
+
+def test_socks5_bind_first_failure_is_terminal(bind_conn: SOCKS5Connection) -> None:
+    failure = _socks5_reply(code=SOCKS5ReplyCode.CONNECTION_REFUSED)
+    events = []
+    _feed_byte_by_byte(bind_conn, failure, events)
+
+    assert events == [
+        SOCKS5Reply(
+            reply_code=SOCKS5ReplyCode.CONNECTION_REFUSED,
+            atype=SOCKS5AType.IPV4_ADDRESS,
+            addr="127.0.0.1",
+            port=1080,
+        )
+    ]
+    assert bind_conn.state == SOCKS5State.MUST_CLOSE
+
+
+def test_socks5_bind_second_failure_is_terminal(bind_conn: SOCKS5Connection) -> None:
+    events = []
+    _feed_byte_by_byte(bind_conn, _socks5_reply(), events)
+    failure = _socks5_reply(code=SOCKS5ReplyCode.CONNECTION_REFUSED)
+    _feed_byte_by_byte(bind_conn, failure, events)
+
+    assert events[0].reply_code == SOCKS5ReplyCode.SUCCEEDED
+    assert events[1].reply_code == SOCKS5ReplyCode.CONNECTION_REFUSED
+    assert bind_conn.state == SOCKS5State.MUST_CLOSE
+
+
+def test_socks5_bind_two_successes_then_tunnel_passthrough(
+    bind_conn: SOCKS5Connection,
+) -> None:
+    first_reply = _socks5_reply()
+    second_reply = _socks5_reply(data=b"hello")
+    chunk = first_reply + second_reply
+
+    events = []
+    events.append(bind_conn.receive_data(chunk))
+    events.append(bind_conn.receive_data(b""))
+
+    assert [event.reply_code for event in events] == [
+        SOCKS5ReplyCode.SUCCEEDED,
+        SOCKS5ReplyCode.SUCCEEDED,
+    ]
+    assert bind_conn.state == SOCKS5State.TUNNEL_READY
+    assert bind_conn.receive_data(b" world") == b"hello world"
