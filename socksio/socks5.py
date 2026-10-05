@@ -3,7 +3,13 @@ import typing
 from functools import singledispatchmethod
 
 from ._types import StrOrBytes
-from .exceptions import ProtocolError
+from .exceptions import (
+    ProtocolError,
+    SOCKS5FragmentNotSupportedError,
+    SOCKS5UDPAssociationClosedError,
+    SOCKS5UDPNotAssociatedError,
+    SOCKSError,
+)
 from .utils import (
     AddressType,
     decode_address,
@@ -269,7 +275,24 @@ class SOCKS5Reply(typing.NamedTuple):
 class SOCKS5Datagram(typing.NamedTuple):
     """Encapsulates a SOCKS5 datagram for UDP connections.
 
-    Currently not implemented.
+    The UDP request header uses the same address formats as the command
+    requests::
+
+        +----+------+------+----------+----------+----------+
+        |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+        +----+------+------+----------+----------+----------+
+        | 2  |  1   |  1   | Variable |    2     | Variable |
+        +----+------+------+----------+----------+----------+
+
+    Only complete, unfragmented datagrams (``FRAG == 0``) are supported.
+
+    Args:
+        atype: The address type of the addr field.
+        addr: Encoded address of the target host, raw IP or raw domain bytes.
+        port: The port number of the target host.
+        data: The datagram payload, kept as arbitrary binary data.
+        fragment: Fragment number, ``0`` for a standalone datagram.
+        last_fragment: Whether this datagram is the last of a fragment series.
     """
 
     atype: SOCKS5AType
@@ -277,15 +300,246 @@ class SOCKS5Datagram(typing.NamedTuple):
     port: int
     data: bytes
 
-    fragment: int
-    last_fragment: bool
+    fragment: int = 0
+    last_fragment: bool = False
+
+    @classmethod
+    def from_address(
+        cls,
+        address: typing.Union[StrOrBytes, typing.Tuple[StrOrBytes, int]],
+        data: bytes,
+    ) -> "SOCKS5Datagram":
+        """Builds a datagram addressed to ``address`` carrying ``data``.
+
+        Args:
+            address: A string in the form 'HOST:PORT' or a tuple of address
+                string and port number. The address type is inferred from it.
+            data: The arbitrary binary payload of the datagram.
+
+        Returns:
+            A SOCKS5Datagram instance.
+        """
+        address, port = get_address_port_tuple_from_address(address)
+        atype, encoded_addr = encode_address(address)
+        return cls(
+            atype=SOCKS5AType.from_atype(atype),
+            addr=encoded_addr,
+            port=port,
+            data=data,
+            last_fragment=True,
+        )
+
+    @property
+    def packed_addr(self) -> bytes:
+        """The address packed in the form required by its address type."""
+        if self.atype == SOCKS5AType.IPV4_ADDRESS:
+            assert len(self.addr) == 4
+            return self.addr
+        elif self.atype == SOCKS5AType.IPV6_ADDRESS:
+            assert len(self.addr) == 16
+            return self.addr
+        else:
+            length = len(self.addr)
+            return length.to_bytes(1, byteorder="big") + self.addr
 
     @classmethod
     def loads(cls, data: bytes) -> "SOCKS5Datagram":
-        raise NotImplementedError()  # pragma: nocover
+        """Unpacks a UDP datagram into an instance.
+
+        Returns:
+            The unpacked datagram instance.
+
+        Raises:
+            ProtocolError: If the data does not match the UDP request header
+                structure (reserved bytes, ATYP, domain length or port).
+            SOCKS5FragmentNotSupportedError: If the FRAG field is non-zero.
+                The fragment is never returned as a complete payload.
+        """
+        if len(data) < 4:
+            raise ProtocolError("Malformed datagram")
+        if data[0:2] != b"\x00\x00":
+            raise ProtocolError("Malformed datagram")
+
+        frag = data[2]
+        if frag != 0:
+            raise SOCKS5FragmentNotSupportedError(
+                f"Fragmented datagrams are not supported (FRAG={frag})"
+            )
+
+        try:
+            atype = SOCKS5AType(data[3:4])
+        except ValueError as exc:
+            raise ProtocolError("Malformed datagram") from exc
+
+        if atype == SOCKS5AType.IPV4_ADDRESS:
+            if len(data) < 10:
+                raise ProtocolError("Malformed datagram")
+            addr = data[4:8]
+            payload_start = 8
+        elif atype == SOCKS5AType.IPV6_ADDRESS:
+            if len(data) < 22:
+                raise ProtocolError("Malformed datagram")
+            addr = data[4:20]
+            payload_start = 20
+        else:
+            if len(data) < 5:
+                raise ProtocolError("Malformed datagram")
+            domain_length = data[4]
+            header_length = 5 + domain_length + 2
+            if len(data) < header_length:
+                raise ProtocolError("Malformed datagram")
+            addr = data[5 : 5 + domain_length]
+            payload_start = 5 + domain_length
+
+        port = int.from_bytes(
+            data[payload_start : payload_start + 2], byteorder="big"
+        )
+        payload = data[payload_start + 2 :]
+
+        return cls(
+            atype=atype,
+            addr=addr,
+            port=port,
+            data=payload,
+            fragment=frag,
+            last_fragment=frag == 0,
+        )
 
     def dumps(self) -> bytes:
-        raise NotImplementedError()  # pragma: nocover
+        """Packs the datagram into the UDP request header plus its payload.
+
+        Returns:
+            The packed datagram.
+
+        Raises:
+            SOCKS5FragmentNotSupportedError: If the instance describes a
+                fragmented datagram.
+            SOCKSError: If the port is outside the valid range or a domain is
+                longer than the 255 bytes allowed by the length field.
+        """
+        if self.fragment != 0:
+            raise SOCKS5FragmentNotSupportedError(
+                "Fragmented datagrams are not supported"
+            )
+        if not 0 <= self.port <= 0xFFFF:
+            raise SOCKSError("Port must be between 0 and 65535")
+        if self.atype == SOCKS5AType.DOMAIN_NAME and len(self.addr) > 255:
+            raise SOCKSError("Domain name must be at most 255 bytes")
+
+        return b"".join(
+            [
+                b"\x00\x00",  # reserved
+                b"\x00",  # FRAG, standalone datagram
+                self.atype,
+                self.packed_addr,
+                self.port.to_bytes(2, byteorder="big"),
+                self.data,
+            ]
+        )
+
+
+class SOCKS5UnsupportedDatagram(typing.NamedTuple):
+    """Event produced for a datagram that could not be handled.
+
+    The first version only rejects fragmented datagrams (``FRAG != 0``). The
+    event is distinct from :class:`SOCKS5Datagram` so the fragment bytes are
+    not mistaken for a complete payload.
+
+    Args:
+        data: The raw datagram bytes that were rejected.
+        fragment: The value of the FRAG field.
+    """
+
+    data: bytes
+    fragment: int
+
+    @property
+    def fragmented(self) -> bool:
+        """Whether the datagram was rejected because it was fragmented."""
+        return self.fragment != 0
+
+
+SOCKS5UDPEvent = typing.Union[SOCKS5Datagram, SOCKS5UnsupportedDatagram]
+
+
+class SOCKS5UDPAssociation:
+    """Sans-I/O side of a UDP ASSOCIATE relay.
+
+    Instances are normally created from the control connection with
+    :meth:`SOCKS5Connection.udp_associate` once the UDP ASSOCIATE command has
+    succeeded. They encode outgoing datagrams and decode datagrams received
+    from the relay while the control connection stays alive.
+
+    Args:
+        relay_addr: Address of the UDP relay the caller must send datagrams
+            to and receive them from.
+        relay_port: Port of the UDP relay.
+        control_connection: The control connection used to establish the
+            association. Datagrams are no longer accepted once it is closed.
+    """
+
+    def __init__(
+        self,
+        relay_addr: str,
+        relay_port: int,
+        control_connection: "SOCKS5Connection",
+    ) -> None:
+        self.relay_addr = relay_addr
+        self.relay_port = relay_port
+        self._connection = control_connection
+        self._data_to_send = bytearray()
+
+    @property
+    def relay_address(self) -> typing.Tuple[str, int]:
+        """The (addr, port) tuple of the UDP relay."""
+        return self.relay_addr, self.relay_port
+
+    def _require_open_association(self) -> None:
+        if not self._connection.is_open:
+            raise SOCKS5UDPAssociationClosedError(
+                "Cannot use a UDP association after the control connection "
+                "has been closed"
+            )
+
+    def send(self, datagram: SOCKS5Datagram) -> None:
+        """Packs a datagram and adds it to the send data buffer.
+
+        Args:
+            datagram: The datagram to be sent through the relay.
+
+        Raises:
+            SOCKS5UDPAssociationClosedError: If the control connection is no
+                longer open.
+        """
+        self._require_open_association()
+        self._data_to_send += datagram.dumps()
+
+    def receive_data(self, data: bytes) -> SOCKS5UDPEvent:
+        """Unpacks data received from the UDP relay.
+
+        Args:
+            data: The raw datagram bytes received from the relay.
+
+        Returns:
+            A :class:`SOCKS5Datagram` for complete datagrams or a
+            :class:`SOCKS5UnsupportedDatagram` for unsupported ones.
+
+        Raises:
+            SOCKS5UDPAssociationClosedError: If the control connection is no
+                longer open.
+            ProtocolError: If the data does not conform to the structure.
+        """
+        self._require_open_association()
+        try:
+            return SOCKS5Datagram.loads(data)
+        except SOCKS5FragmentNotSupportedError:  # first version: no fragments
+            return SOCKS5UnsupportedDatagram(data=data, fragment=data[2])
+
+    def data_to_send(self) -> bytes:
+        """Returns the buffered encoded datagrams and clears the buffer."""
+        data = bytes(self._data_to_send)
+        self._data_to_send = bytearray()
+        return data
 
 
 class SOCKS5State(enum.IntEnum):
@@ -314,11 +568,32 @@ class SOCKS5Connection:
         self._data_to_send = bytearray()
         self._received_data = bytearray()
         self._state = SOCKS5State.CLIENT_AUTH_REQUIRED
+        self._last_command: typing.Optional[SOCKS5Command] = None
+        self.associated_address: typing.Optional[typing.Tuple[str, int]] = None
+        self._udp_association: typing.Optional[SOCKS5UDPAssociation] = None
 
     @property
     def state(self) -> SOCKS5State:
         """Returns the current state of the protocol."""
         return self._state
+
+    @property
+    def is_open(self) -> bool:
+        """Whether the control connection can still be used.
+
+        A connection that must be closed because of a failed command or that
+        has been explicitly closed can no longer be used, including for UDP
+        associations created from it.
+        """
+        return self._state != SOCKS5State.MUST_CLOSE
+
+    def close(self) -> None:
+        """Marks the control connection as closed.
+
+        Any UDP association established through this connection stops
+        accepting datagrams afterwards.
+        """
+        self._state = SOCKS5State.MUST_CLOSE
 
     @singledispatchmethod
     def send(self, request: SOCKS5RequestType) -> None:
@@ -349,6 +624,7 @@ class SOCKS5Connection:
             raise ProtocolError(
                 "SOCKS5 connections must be authenticated before sending a request"
             )
+        self._last_command = request.command
         self._data_to_send += request.dumps()
 
     def receive_data(
@@ -382,12 +658,78 @@ class SOCKS5Connection:
             reply = SOCKS5Reply.loads(data)
             if reply.reply_code == SOCKS5ReplyCode.SUCCEEDED:
                 self._state = SOCKS5State.TUNNEL_READY
+                if self._last_command == SOCKS5Command.UDP_ASSOCIATE:
+                    self.associated_address = (reply.addr, reply.port)
             else:
                 self._state = SOCKS5State.MUST_CLOSE
 
             return reply
 
         raise NotImplementedError()  # pragma: nocover
+
+    def udp_associate(
+        self,
+        control_peer: typing.Optional[
+            typing.Union[StrOrBytes, typing.Tuple[StrOrBytes, int]]
+        ] = None,
+    ) -> SOCKS5UDPAssociation:
+        """Creates the UDP association after a successful UDP ASSOCIATE reply.
+
+        The relay address is taken from the proxy's reply. Per RFC 1928 a
+        reply with an all-zero address (``0.0.0.0`` and port ``0``) means the
+        client should send datagrams to the control connection's peer. In that
+        case the caller must provide that peer explicitly via ``control_peer``;
+        this method never performs DNS resolution or any network access.
+
+        Args:
+            control_peer: Peer of the control connection, as a
+                ``(address, port)`` tuple or an ``'address:port'`` string.
+                Required when the relay returned an all-zero address, ignored
+                otherwise.
+
+        Returns:
+            The ready to use :class:`SOCKS5UDPAssociation`.
+
+        Raises:
+            SOCKS5UDPNotAssociatedError: If the tunnel is not ready, the last
+                command was not UDP ASSOCIATE, the control connection is
+                closed or the reply address is all-zero without a
+                ``control_peer``.
+        """
+        if not self.is_open:
+            raise SOCKS5UDPNotAssociatedError(
+                "Cannot create a UDP association on a closed control connection"
+            )
+        if self._state != SOCKS5State.TUNNEL_READY:
+            raise SOCKS5UDPNotAssociatedError(
+                "Cannot create a UDP association before a successful UDP "
+                "ASSOCIATE reply"
+            )
+        if self._last_command != SOCKS5Command.UDP_ASSOCIATE:
+            raise SOCKS5UDPNotAssociatedError(
+                "The last command was not UDP ASSOCIATE"
+            )
+
+        if self._udp_association is not None:
+            return self._udp_association
+
+        assert self.associated_address is not None
+        relay_addr, relay_port = self.associated_address
+        if relay_addr in ("0.0.0.0", "::") and relay_port == 0:
+            if control_peer is None:
+                raise SOCKS5UDPNotAssociatedError(
+                    "The proxy returned an all-zero relay address, the control "
+                    "connection peer must be provided"
+                )
+            peer_addr, peer_port = get_address_port_tuple_from_address(control_peer)
+            relay_addr, relay_port = peer_addr, peer_port
+
+        self._udp_association = SOCKS5UDPAssociation(
+            relay_addr=relay_addr,
+            relay_port=relay_port,
+            control_connection=self,
+        )
+        return self._udp_association
 
     def data_to_send(self) -> bytes:
         """Returns the data to be sent via the I/O library of choice.

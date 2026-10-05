@@ -20,7 +20,7 @@ it in any I/O library you want.
 Features not yet implemented:
 
 - SOCKS5 GSS-API authentication.
-- SOCKS5 UDP associate requests.
+- Fragmented SOCKS5 UDP datagrams (only complete datagrams are supported).
 
 ## Usage
 

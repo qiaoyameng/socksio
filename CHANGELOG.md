@@ -3,6 +3,12 @@
 ## Unreleased
 
 - Drop support for Python <3.10, Python 3.10 is now the minimum supported/tested version
+- Add SOCKS5 UDP ASSOCIATE support: `SOCKS5Datagram` encode/decode for IPv4,
+  IPv6 and domain addresses with arbitrary binary payloads, plus a
+  `SOCKS5UDPAssociation` sans-I/O object bound to the control connection.
+  Fragmented datagrams (non-zero FRAG) are reported as
+  `SOCKS5UnsupportedDatagram` events and datagrams stop being accepted once
+  the control connection fails or is closed.
 
 ## 1.0.0 (2020-04-17)
 
