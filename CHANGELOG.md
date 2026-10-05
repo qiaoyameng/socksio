@@ -3,6 +3,9 @@
 ## Unreleased
 
 - Drop support for Python <3.10, Python 3.10 is now the minimum supported/tested version
+- Add `SOCKS5ServerConnection`, a sans-I/O server-side SOCKS5 protocol
+  implementation supporting NO AUTH and username/password authentication and
+  CONNECT commands with IPv4, IPv6 and domain name targets
 
 ## 1.0.0 (2020-04-17)
 
