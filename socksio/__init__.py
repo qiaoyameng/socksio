@@ -1,6 +1,6 @@
 """Sans-I/O implementation of SOCKS4, SOCKS4A, and SOCKS5."""
 
-from .exceptions import ProtocolError, SOCKSError
+from .exceptions import FragmentationNotSupported, ProtocolError, SOCKSError
 from .socks4 import (
     SOCKS4ARequest,
     SOCKS4Command,
@@ -17,8 +17,10 @@ from .socks5 import (
     SOCKS5Command,
     SOCKS5CommandRequest,
     SOCKS5Connection,
+    SOCKS5Datagram,
     SOCKS5Reply,
     SOCKS5ReplyCode,
+    SOCKS5UDPAssociation,
     SOCKS5UsernamePasswordRequest,
 )
 
@@ -38,9 +40,12 @@ __all__ = [
     "SOCKS5Connection",
     "SOCKS5Command",
     "SOCKS5CommandRequest",
+    "SOCKS5Datagram",
     "SOCKS5ReplyCode",
     "SOCKS5Reply",
+    "SOCKS5UDPAssociation",
     "SOCKS5UsernamePasswordRequest",
+    "FragmentationNotSupported",
     "SOCKSError",
     "ProtocolError",
 ]
