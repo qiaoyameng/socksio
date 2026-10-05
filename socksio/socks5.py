@@ -298,6 +298,8 @@ class SOCKS5State(enum.IntEnum):
     CLIENT_WAITING_FOR_USERNAME_PASSWORD = 5
     SERVER_VERIFY_USERNAME_PASSWORD = 6
     MUST_CLOSE = 7
+    SERVER_BIND_REPLY = 8
+    SERVER_BIND_PEER_REPLY = 9
 
 
 SOCKS5RequestType = typing.Union[SOCKS5AuthMethodsRequest, SOCKS5CommandRequest]
@@ -310,9 +312,18 @@ class SOCKS5Connection:
     data into their appropriate reply objects.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, rfc_addressed: bool = False) -> None:
+        """Initializes the connection.
+
+        Args:
+            rfc_addressed: Whether command replies with domain addresses
+                include the RFC-mandated length byte. The original SOCKS5
+                implementation omitted it, so this defaults to ``False``.
+        """
         self._data_to_send = bytearray()
         self._received_data = bytearray()
+        self._tunnel_data = bytearray()
+        self._rfc_addressed = rfc_addressed
         self._state = SOCKS5State.CLIENT_AUTH_REQUIRED
 
     @property
@@ -345,23 +356,41 @@ class SOCKS5Connection:
 
     @send.register(SOCKS5CommandRequest)
     def _command(self, request: SOCKS5CommandRequest) -> None:
-        if self._state < SOCKS5State.CLIENT_AUTHENTICATED:
+        if self._state not in (
+            SOCKS5State.CLIENT_AUTHENTICATED,
+            SOCKS5State.TUNNEL_READY,
+        ):
             raise ProtocolError(
                 "SOCKS5 connections must be authenticated before sending a request"
             )
         self._data_to_send += request.dumps()
+        if request.command == SOCKS5Command.BIND:
+            self._state = SOCKS5State.SERVER_BIND_REPLY
 
     def receive_data(
         self, data: bytes
-    ) -> typing.Union[SOCKS5AuthReply, SOCKS5Reply, SOCKS5UsernamePasswordReply]:
-        """Unpacks response data into a reply object.
+    ) -> typing.Union[
+        SOCKS5AuthReply, SOCKS5Reply, SOCKS5UsernamePasswordReply, None
+    ]:
+        """Unpacks response data into a reply event.
+
+        Command replies have a variable length, so data may be fed one byte at
+        a time. Incomplete data is buffered and ``None`` is returned until a
+        full reply is available. After the tunnel is established, any received
+        data is treated as opaque tunnel data, including data piggy-backed on
+        the final BIND reply; retrieve it with :meth:`tunnel_data`.
 
         Args:
             data: The raw response data from the proxy server.
 
         Returns:
-            A reply instance corresponding to the connection state and reply data.
+            A reply instance corresponding to the connection state and reply
+            data, or ``None`` if more reply data is expected.
         """
+        if self._state in (SOCKS5State.TUNNEL_READY, SOCKS5State.MUST_CLOSE):
+            self._tunnel_data += data
+            return None
+
         if self._state == SOCKS5State.SERVER_AUTH_REPLY:
             auth_reply = SOCKS5AuthReply.loads(data)
             if auth_reply.method == SOCKS5AuthMethod.USERNAME_PASSWORD:
@@ -378,16 +407,98 @@ class SOCKS5Connection:
                 self._state = SOCKS5State.MUST_CLOSE
             return username_password_reply
 
-        if self._state == SOCKS5State.CLIENT_AUTHENTICATED:
-            reply = SOCKS5Reply.loads(data)
-            if reply.reply_code == SOCKS5ReplyCode.SUCCEEDED:
-                self._state = SOCKS5State.TUNNEL_READY
-            else:
+        if self._state in (
+            SOCKS5State.CLIENT_AUTHENTICATED,
+            SOCKS5State.SERVER_BIND_REPLY,
+            SOCKS5State.SERVER_BIND_PEER_REPLY,
+        ):
+            self._received_data += data
+            try:
+                framed = self._extract_command_reply()
+            except ProtocolError:
+                self._received_data = bytearray()
                 self._state = SOCKS5State.MUST_CLOSE
+                raise
+            if framed is None:
+                return None
+
+            reply_data, extra_data = framed
+            try:
+                reply = SOCKS5Reply.loads(reply_data)
+            except ProtocolError:
+                self._received_data = bytearray()
+                self._state = SOCKS5State.MUST_CLOSE
+                self._tunnel_data += extra_data
+                raise
+
+            self._received_data = bytearray()
+            self._tunnel_data += extra_data
+
+            if reply.reply_code != SOCKS5ReplyCode.SUCCEEDED:
+                self._state = SOCKS5State.MUST_CLOSE
+            elif self._state == SOCKS5State.SERVER_BIND_REPLY:
+                self._state = SOCKS5State.SERVER_BIND_PEER_REPLY
+            else:
+                self._state = SOCKS5State.TUNNEL_READY
 
             return reply
 
         raise NotImplementedError()  # pragma: nocover
+
+    def _extract_command_reply(self) -> typing.Optional[typing.Tuple[bytes, bytes]]:
+        """Splits a buffered command reply from any trailing data.
+
+        Returns the complete reply data and the leftover bytes, or ``None`` if
+        the reply is incomplete. Raises :class:`ProtocolError` if a complete
+        reply cannot be framed or contains an invalid address type.
+        """
+        buffer = bytes(self._received_data)
+
+        if len(buffer) < 5:
+            return None
+
+        if buffer[3:4] == SOCKS5AType.IPV4_ADDRESS:
+            length = 10
+        elif buffer[3:4] == SOCKS5AType.IPV6_ADDRESS:
+            length = 22
+        elif buffer[3:4] == SOCKS5AType.DOMAIN_NAME:
+            # The RFC places a domain length byte before the domain. The
+            # original implementation omitted it, so that framing is used by
+            # default; enable RFC framing explicitly when needed.
+            if self._rfc_addressed:
+                domain_length = buffer[4] if len(buffer) >= 5 else 0
+                rfc_length = 7 + domain_length
+                if not domain_length or len(buffer) < rfc_length:
+                    return None
+                legacy = (
+                    buffer[:4]
+                    + buffer[5 : 4 + domain_length + 1]
+                    + buffer[4 + domain_length + 1 :]
+                )
+                self._received_data = bytearray(legacy)
+                buffer = legacy
+                length = 6 + domain_length
+            else:
+                # Legacy framing carries no domain length; the bytes before
+                # the trailing port are the complete domain.
+                length = len(buffer)
+        else:
+            raise ProtocolError("Malformed reply")
+
+        if len(buffer) < length:
+            return None
+
+        return buffer[:length], buffer[length:]
+
+    def tunnel_data(self) -> bytes:
+        """Returns any opaque data received after the tunnel was established.
+
+        This includes tunnel data that arrived in the same read as the final
+        BIND reply. Also clears the connection's buffer.
+        """
+        data = bytes(self._tunnel_data)
+        self._tunnel_data = bytearray()
+        return data
 
     def data_to_send(self) -> bytes:
         """Returns the data to be sent via the I/O library of choice.

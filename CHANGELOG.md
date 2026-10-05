@@ -3,6 +3,13 @@
 ## Unreleased
 
 - Drop support for Python <3.10, Python 3.10 is now the minimum supported/tested version
+- Added the full two-reply BIND state machine to `SOCKS4Connection` and
+  `SOCKS5Connection`. The first successful reply produces a listening-address
+  event without entering the tunnel state; the second reply signals the
+  connected peer. Partial replies are buffered so data can be fed one byte at
+  a time, tunnel data arriving with the final reply is exposed via
+  `Connection.tunnel_data()`, failures move the connection to a terminal
+  state, and new commands are rejected while a BIND reply is pending.
 
 ## 1.0.0 (2020-04-17)
 

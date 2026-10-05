@@ -206,6 +206,17 @@ class SOCKS4Reply(typing.NamedTuple):
             raise ProtocolError("Malformed reply") from exc
 
 
+class SOCKS4State(enum.IntEnum):
+    """Enumeration of SOCKS4 protocol states."""
+
+    CLIENT_COMMAND_REQUIRED = 1
+    SERVER_REPLY = 2
+    SERVER_BIND_REPLY = 3
+    SERVER_BIND_PEER_REPLY = 4
+    TUNNEL_READY = 5
+    MUST_CLOSE = 6
+
+
 class SOCKS4Connection:
     """Encapsulates a SOCKS4 and SOCKS4A connection.
 
@@ -221,27 +232,94 @@ class SOCKS4Connection:
 
         self._data_to_send = bytearray()
         self._received_data = bytearray()
+        self._tunnel_data = bytearray()
+        self._state = SOCKS4State.CLIENT_COMMAND_REQUIRED
+
+    @property
+    def state(self) -> SOCKS4State:
+        """Returns the current state of the protocol."""
+        return self._state
 
     def send(self, request: typing.Union[SOCKS4Request, SOCKS4ARequest]) -> None:
         """Packs a request object and adds it to the send data buffer.
 
+        Also progresses the protocol state of the connection.
+
         Args:
             request: The request instance to be packed.
         """
+        if self._state not in (
+            SOCKS4State.CLIENT_COMMAND_REQUIRED,
+            SOCKS4State.TUNNEL_READY,
+        ):
+            raise ProtocolError(
+                "Cannot send another command while waiting for a reply"
+            )
+
         user_id = request.user_id or self.user_id
         self._data_to_send += request.dumps(user_id=user_id)
+        if request.command == SOCKS4Command.BIND:
+            self._state = SOCKS4State.SERVER_BIND_REPLY
+        else:
+            self._state = SOCKS4State.SERVER_REPLY
 
-    def receive_data(self, data: bytes) -> SOCKS4Reply:
-        """Unpacks response data into a reply object.
+    def receive_data(self, data: bytes) -> typing.Optional[SOCKS4Reply]:
+        """Unpacks response data into a reply event.
+
+        A reply spans exactly 8 bytes, so data may be fed one byte at a time.
+        Incomplete data is buffered and ``None`` is returned until a full reply
+        is available. After the tunnel is established, any received data is
+        treated as opaque tunnel data, including data piggy-backed on the final
+        BIND reply; retrieve it with :meth:`tunnel_data`.
 
         Args:
             data: The raw response data from the proxy server.
 
         Returns:
-            The appropriate reply object.
+            The reply event, or ``None`` if more reply data is expected.
+
+        Raises:
+            ProtocolError: If a complete reply does not match the spec. The
+                connection moves to the :attr:`SOCKS4State.MUST_CLOSE` state.
         """
+        if self._state in (SOCKS4State.TUNNEL_READY, SOCKS4State.MUST_CLOSE):
+            self._tunnel_data += data
+            return None
+
         self._received_data += data
-        return SOCKS4Reply.loads(bytes(self._received_data))
+        if len(self._received_data) < 8:
+            return None
+
+        reply_data = bytes(self._received_data[:8])
+        extra_data = bytes(self._received_data[8:])
+        self._received_data = bytearray()
+
+        try:
+            reply = SOCKS4Reply.loads(reply_data)
+        except ProtocolError:
+            self._state = SOCKS4State.MUST_CLOSE
+            self._tunnel_data += extra_data
+            raise
+
+        if reply.reply_code != SOCKS4ReplyCode.REQUEST_GRANTED:
+            self._state = SOCKS4State.MUST_CLOSE
+        elif self._state == SOCKS4State.SERVER_BIND_REPLY:
+            self._state = SOCKS4State.SERVER_BIND_PEER_REPLY
+        else:
+            self._state = SOCKS4State.TUNNEL_READY
+
+        self._tunnel_data += extra_data
+        return reply
+
+    def tunnel_data(self) -> bytes:
+        """Returns any opaque data received after the tunnel was established.
+
+        This includes tunnel data that arrived in the same read as the final
+        BIND reply. Also clears the connection's buffer.
+        """
+        data = bytes(self._tunnel_data)
+        self._tunnel_data = bytearray()
+        return data
 
     def data_to_send(self) -> bytes:
         """Returns the data to be sent via the I/O library of choice.

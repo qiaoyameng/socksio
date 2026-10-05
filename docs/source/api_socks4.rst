@@ -17,6 +17,9 @@ Neither support IPv6.
 .. autoclass:: SOCKS4Connection
    :members:
 
+.. autoclass:: SOCKS4State
+    :members:
+
 .. autoclass:: SOCKS4Request
    :members: from_address, dumps
 
